@@ -4,5 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+age-core = "0.10.0"
+age-plugin = "0.5.0"
+base64 = "0.22.0"
+bech32 = "0.9.0"
+clap = { version = "4.5.4", features = ["derive"] }
 testresult = "0.4.0"
+thiserror = "1.0.59"
 tss-esapi = { version = "8.0.0-alpha", features = ["generate-bindings"] }
+subtle = "2.5.0"
+zeroize = "1.7.0"
