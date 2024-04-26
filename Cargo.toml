@@ -14,3 +14,4 @@ thiserror = "1.0.59"
 tss-esapi = { version = "8.0.0-alpha", features = ["generate-bindings"] }
 subtle = "2.5.0"
 zeroize = "1.7.0"
+getrandom = "0.2.14"

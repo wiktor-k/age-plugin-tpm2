@@ -51,6 +51,7 @@ dependencies = [
  "base64 0.22.0",
  "bech32",
  "clap",
+ "getrandom",
  "subtle",
  "testresult",
  "thiserror",

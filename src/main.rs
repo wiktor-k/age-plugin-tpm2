@@ -38,7 +38,7 @@ use tss_esapi::{
 
 // Use lower-case HRP to avoid https://github.com/rust-bitcoin/rust-bech32/issues/40
 const IDENTITY_PREFIX: &str = "age-plugin-tpm2-";
-const PUBLIC_KEY_PREFIX: &str = "age";
+const PUBLIC_KEY_PREFIX: &str = "age1tpmt";
 const PLUGIN_NAME: &str = "tpm2";
 
 pub const RECIPIENT_TAG: &str = "p256";
@@ -46,16 +46,41 @@ const RECIPIENT_KEY_LABEL: &[u8] = b"age-encryption.org/v1/p256";
 
 pub const EPK_LEN_BYTES: usize = 64;
 pub const ENCRYPTED_FILE_KEY_BYTES: usize = FILE_KEY_BYTES + 16;
-struct RecipientPlugin;
+
+#[derive(Debug, Default)]
+struct RecipientPlugin {
+    keys: Vec<([u8; 32], [u8; 32])>,
+}
 
 impl RecipientPluginV1 for RecipientPlugin {
     fn add_recipient(
         &mut self,
-        _index: usize,
-        _plugin_name: &str,
-        _bytes: &[u8],
+        index: usize,
+        plugin_name: &str,
+        bytes: &[u8],
     ) -> Result<(), recipient::Error> {
-        todo!()
+        if plugin_name == PLUGIN_NAME {
+            self.keys.push((
+                bytes[0..32]
+                    .try_into()
+                    .map_err(|_| recipient::Error::Identity {
+                        index,
+                        message: "invalid recipient".into(),
+                    })?,
+                bytes[32..64]
+                    .try_into()
+                    .map_err(|_| recipient::Error::Identity {
+                        index,
+                        message: "invalid recipient".into(),
+                    })?,
+            ));
+            Ok(())
+        } else {
+            Err(recipient::Error::Identity {
+                index,
+                message: "invalid recipient".into(),
+            })
+        }
     }
 
     fn add_identity(
@@ -72,7 +97,17 @@ impl RecipientPluginV1 for RecipientPlugin {
         _file_keys: Vec<FileKey>,
         _callbacks: impl Callbacks<recipient::Error>,
     ) -> io::Result<Result<Vec<Vec<Stanza>>, Vec<recipient::Error>>> {
-        todo!()
+        let results = vec![];
+        let context = get_context().expect("context to work");
+        for (x, y) in self.keys.iter() {
+            let key_handle = context.load_external_public(
+                get_key(&mut context, x, y)?,
+                tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
+            )?;
+            let (z_point, pub_point) = context.ecdh_key_gen(key_handle)?;
+            //
+        }
+        Ok(Ok(results))
     }
 }
 
@@ -81,7 +116,7 @@ struct CardStub {
 }
 
 struct IdentityPlugin {
-    cards: Vec<CardStub>,
+    keys: Vec<([u8; 32], [u8; 32])>,
 }
 
 use base64::{prelude::BASE64_STANDARD_NO_PAD, Engine};
@@ -134,47 +169,49 @@ impl IdentityPlugin {
             .try_into()
             .expect("Length should have been checked above");
 
-        let mut context = get_context()?;
-        let key = get_key(&mut context)?;
-        let z_value = context.ecdh_z_gen(
-            key.key_handle,
-            EccPoint::new(
-                EccParameter::from_bytes(&ephemeral_share[0..32])?,
-                EccParameter::from_bytes(&ephemeral_share[32..64])?,
-            ),
-        )?;
-        let shared_secret = z_value.x();
+        for (x, y) in self.keys.iter() {
+            let mut context = get_context()?;
+            let key = create_key(&mut context, x, y)?;
+            let z_value = context.ecdh_z_gen(
+                key.key_handle,
+                EccPoint::new(
+                    EccParameter::from_bytes(&ephemeral_share[0..32])?,
+                    EccParameter::from_bytes(&ephemeral_share[32..64])?,
+                ),
+            )?;
+            let shared_secret = z_value.x();
 
-        if shared_secret
-            .iter()
-            .fold(0, |acc, b| acc | b)
-            .ct_eq(&0)
-            .into()
-        {
-            return Err(DecryptError::InvalidHeader.into());
-        }
+            if shared_secret
+                .iter()
+                .fold(0, |acc, b| acc | b)
+                .ct_eq(&0)
+                .into()
+            {
+                return Err(DecryptError::InvalidHeader.into());
+            }
 
-        let mut salt = [0; 64];
-        salt[..32].copy_from_slice(&ephemeral_share);
-        if let Public::Ecc { unique, .. } = key.out_public {
-            salt[32..].copy_from_slice(&unique.x()[..]);
-        }
+            let mut salt = [0; 64];
+            salt[..32].copy_from_slice(&ephemeral_share);
+            if let Public::Ecc { unique, .. } = key.out_public {
+                salt[32..].copy_from_slice(&unique.x()[..]);
+            }
 
-        let enc_key = hkdf(&salt, RECIPIENT_KEY_LABEL, &shared_secret);
+            let enc_key = hkdf(&salt, RECIPIENT_KEY_LABEL, &shared_secret);
 
-        // A failure to decrypt is non-fatal (we try to decrypt the recipient
-        // stanza with other X25519 keys), because we cannot tell which key
-        // matches a particular stanza.
-        if let Some(result) = aead_decrypt(&enc_key, FILE_KEY_BYTES, &encrypted_file_key)
-            .ok()
-            .map(|mut pt| {
-                // It's ours!
-                let file_key: [u8; FILE_KEY_BYTES] = pt[..].try_into().unwrap();
-                pt.zeroize();
-                FileKey::from(file_key)
-            })
-        {
-            return Ok(Some(result));
+            // A failure to decrypt is non-fatal (we try to decrypt the recipient
+            // stanza with other X25519 keys), because we cannot tell which key
+            // matches a particular stanza.
+            if let Some(result) = aead_decrypt(&enc_key, FILE_KEY_BYTES, &encrypted_file_key)
+                .ok()
+                .map(|mut pt| {
+                    // It's ours!
+                    let file_key: [u8; FILE_KEY_BYTES] = pt[..].try_into().unwrap();
+                    pt.zeroize();
+                    FileKey::from(file_key)
+                })
+            {
+                return Ok(Some(result));
+            }
         }
         Ok(None)
     }
@@ -188,9 +225,20 @@ impl IdentityPluginV1 for IdentityPlugin {
         bytes: &[u8],
     ) -> Result<(), identity::Error> {
         if plugin_name == PLUGIN_NAME {
-            self.cards.push(CardStub {
-                ident: String::from_utf8_lossy(bytes).to_string(),
-            });
+            self.keys.push((
+                bytes[0..32]
+                    .try_into()
+                    .map_err(|_| identity::Error::Identity {
+                        index,
+                        message: "invalid recipient".into(),
+                    })?,
+                bytes[32..64]
+                    .try_into()
+                    .map_err(|_| identity::Error::Identity {
+                        index,
+                        message: "invalid recipient".into(),
+                    })?,
+            ));
             Ok(())
         } else {
             Err(identity::Error::Identity {
@@ -243,13 +291,18 @@ fn main() -> TestResult {
     if let Some(state_machine) = opts.age_plugin {
         return Ok(run_state_machine(
             &state_machine,
-            Some(|| RecipientPlugin),
-            Some(|| IdentityPlugin { cards: vec![] }),
+            Some(|| RecipientPlugin::default()),
+            Some(|| IdentityPlugin { keys: vec![] }),
         )?);
     }
 
     let mut context = get_context()?;
-    let mut key = get_key(&mut context)?;
+    let mut random = [0u8; 64];
+    getrandom::getrandom(&mut random)?;
+    println!("XX: {}", random.len());
+    let x: [u8; 32] = random[0..32].try_into()?;
+    let y: [u8; 32] = random[32..64].try_into()?;
+    let mut key = create_key(&mut context, &x, &y)?;
 
     if let Public::Ecc { unique, .. } = key.out_public {
         println!(
@@ -260,7 +313,7 @@ fn main() -> TestResult {
 
     println!(
         "{}",
-        bech32::encode(IDENTITY_PREFIX, [1, 2, 3].to_base32(), Variant::Bech32,)?.to_uppercase()
+        bech32::encode(IDENTITY_PREFIX, random.to_base32(), Variant::Bech32,)?.to_uppercase()
     );
     println!();
 
@@ -290,7 +343,7 @@ fn get_context() -> tss_esapi::Result<Context> {
     Ok(context)
 }
 
-fn get_key(context: &mut Context) -> tss_esapi::Result<CreatePrimaryKeyResult> {
+fn get_key(context: &mut Context, x: &[u8; 32], y: &[u8; 32]) -> tss_esapi::Result<Public> {
     let ecc_parms = PublicEccParametersBuilder::new()
         .with_ecc_scheme(EccScheme::EcDh(HashScheme::new(HashingAlgorithm::Sha256)))
         .with_curve(EccCurve::NistP256)
@@ -315,9 +368,20 @@ fn get_key(context: &mut Context) -> tss_esapi::Result<CreatePrimaryKeyResult> {
         .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
         .with_object_attributes(object_attributes)
         .with_ecc_parameters(ecc_parms)
-        .with_ecc_unique_identifier(EccPoint::default())
+        .with_ecc_unique_identifier(EccPoint::new(
+            EccParameter::from_bytes(x)?,
+            EccParameter::from_bytes(y)?,
+        ))
         .build()?;
+    Ok(public)
+}
 
+fn create_key(
+    mut context: &mut Context,
+    x: &[u8; 32],
+    y: &[u8; 32],
+) -> tss_esapi::Result<CreatePrimaryKeyResult> {
+    let public = get_key(&mut context, x, y)?;
     let key_handle = context.create_primary(
         tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
         public,
