@@ -41,6 +41,7 @@ const IDENTITY_PREFIX: &str = "age-plugin-tpm2-";
 const PUBLIC_KEY_PREFIX: &str = "age1tpmt";
 const PLUGIN_NAME: &str = "tpm2";
 
+const STANZA_TAG: &str = "piv-p256";
 pub const RECIPIENT_TAG: &str = "p256";
 const RECIPIENT_KEY_LABEL: &[u8] = b"age-encryption.org/v1/p256";
 
@@ -98,14 +99,21 @@ impl RecipientPluginV1 for RecipientPlugin {
         _callbacks: impl Callbacks<recipient::Error>,
     ) -> io::Result<Result<Vec<Vec<Stanza>>, Vec<recipient::Error>>> {
         let results = vec![];
-        let context = get_context().expect("context to work");
+        let mut context = get_context().expect("context to work");
         for (x, y) in self.keys.iter() {
-            let key_handle = context.load_external_public(
-                get_key(&mut context, x, y)?,
-                tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
-            )?;
-            let (z_point, pub_point) = context.ecdh_key_gen(key_handle)?;
-            //
+            let key = get_key(&mut context, x, y).expect("key to work");
+            let key_handle = context
+                .load_external_public(
+                    key,
+                    tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
+                )
+                .expect("load ext to work");
+            let (z_point, pub_point) = context.ecdh_key_gen(key_handle).expect("keygen to work");
+            results.push(Stanza {
+                tag: STANZA_TAG.into(),
+                args: vec![pub_point.x(), pub_point.y()],
+                body: z_point.x().to_vec(),
+            });
         }
         Ok(Ok(results))
     }
