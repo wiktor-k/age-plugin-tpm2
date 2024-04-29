@@ -95,25 +95,38 @@ impl RecipientPluginV1 for RecipientPlugin {
 
     fn wrap_file_keys(
         &mut self,
-        _file_keys: Vec<FileKey>,
+        file_keys: Vec<FileKey>,
         _callbacks: impl Callbacks<recipient::Error>,
     ) -> io::Result<Result<Vec<Vec<Stanza>>, Vec<recipient::Error>>> {
-        let results = vec![];
+        let mut results = vec![];
         let mut context = get_context().expect("context to work");
         for (x, y) in self.keys.iter() {
-            let key = get_key(&mut context, x, y).expect("key to work");
+            let key = get_key(x, y).expect("key to work");
             let key_handle = context
                 .load_external_public(
                     key,
                     tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
                 )
                 .expect("load ext to work");
-            let (z_point, pub_point) = context.ecdh_key_gen(key_handle).expect("keygen to work");
-            results.push(Stanza {
-                tag: STANZA_TAG.into(),
-                args: vec![pub_point.x(), pub_point.y()],
-                body: z_point.x().to_vec(),
-            });
+            let (z_point, _pub_point) = context.ecdh_key_gen(key_handle).expect("keygen to work");
+
+            results.push(
+                file_keys
+                    .iter()
+                    .map(|file_key| Stanza {
+                        tag: STANZA_TAG.into(),
+                        args: vec![],
+                        body: age_core::primitives::aead_encrypt(
+                            z_point
+                                .x()
+                                .as_bytes()
+                                .try_into()
+                                .expect("key to be of right size"),
+                            file_key.expose_secret(),
+                        ),
+                    })
+                    .collect::<Vec<_>>(),
+            );
         }
         Ok(Ok(results))
     }
@@ -310,7 +323,7 @@ fn main() -> TestResult {
     println!("XX: {}", random.len());
     let x: [u8; 32] = random[0..32].try_into()?;
     let y: [u8; 32] = random[32..64].try_into()?;
-    let mut key = create_key(&mut context, &x, &y)?;
+    let key = create_key(&mut context, &x, &y)?;
 
     if let Public::Ecc { unique, .. } = key.out_public {
         println!(
@@ -351,7 +364,7 @@ fn get_context() -> tss_esapi::Result<Context> {
     Ok(context)
 }
 
-fn get_key(context: &mut Context, x: &[u8; 32], y: &[u8; 32]) -> tss_esapi::Result<Public> {
+fn get_key(x: &[u8; 32], y: &[u8; 32]) -> tss_esapi::Result<Public> {
     let ecc_parms = PublicEccParametersBuilder::new()
         .with_ecc_scheme(EccScheme::EcDh(HashScheme::new(HashingAlgorithm::Sha256)))
         .with_curve(EccCurve::NistP256)
@@ -389,7 +402,7 @@ fn create_key(
     x: &[u8; 32],
     y: &[u8; 32],
 ) -> tss_esapi::Result<CreatePrimaryKeyResult> {
-    let public = get_key(&mut context, x, y)?;
+    let public = get_key(x, y)?;
     let key_handle = context.create_primary(
         tss_esapi::interface_types::resource_handles::Hierarchy::Owner,
         public,
